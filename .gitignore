@@ -1,0 +1,4 @@
+.DS_Store
+mods/orca-status/fleet.json
+mods/orca-status/*.d.ts
+mods/orca-status/jsconfig.json
