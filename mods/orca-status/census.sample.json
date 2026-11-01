@@ -1,0 +1,68 @@
+{
+  "generated_at": "2026-11-01T16:10:00Z",
+  "hosts": [{ "host": "web", "host_label": "web-1" }, { "host": "lan", "host_label": "office" }],
+  "apps": [
+    {
+      "name": "n8n", "safe": "1.90.2", "newest": "1.92.0", "error": null, "note": null,
+      "command": "this sample command must never show",
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "n8n container", "installed": "1.88.0", "status": "behind 2", "reason": null,
+          "running": { "container": "n8n", "state": "running", "health": "healthy", "status": "Up 8 days" } },
+        { "host": "lan", "host_label": "office", "where": "automation stack", "installed": "1.90.2", "status": "current", "reason": null,
+          "running": { "container": "n8n-lan", "state": "running", "health": "none", "status": "Up 3 hours" } }
+      ]
+    },
+    {
+      "name": "vaultwarden", "safe": "1.33.2", "newest": "1.33.2", "error": null, "note": null,
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "vaultwarden container", "installed": "1.33.2", "status": "current", "reason": null,
+          "running": { "container": "vaultwarden", "state": "running", "health": "unhealthy", "status": "Up 2 days (unhealthy)" } },
+        { "host": "lan", "host_label": "office", "where": "backup instance", "installed": "1.33.0", "status": "behind 1", "reason": null,
+          "running": { "container": "vaultwarden-backup", "state": "running", "health": "starting", "status": "Up 20 seconds (health: starting)" } }
+      ]
+    },
+    {
+      "name": "plausible", "safe": "2.1.5", "newest": "2.1.5", "error": null, "note": null,
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "analytics stack with a long descriptive name", "installed": "2.2.0-rc.1", "status": "ahead", "reason": "Pinned to a release candidate",
+          "running": { "container": "plausible", "state": "running", "health": "none", "status": "Up 5 days" } },
+        { "host": "lan", "host_label": "office", "where": "plausible container", "installed": null, "status": "missing", "reason": "No container named plausible on this host" }
+      ]
+    },
+    {
+      "name": "caddy", "safe": "2.9.1", "newest": "2.9.1", "error": null, "note": null,
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "system service", "installed": "2.9.1", "status": "current", "reason": null, "running": null },
+        { "host": "lan", "host_label": "office", "where": "system service", "installed": null, "status": "unreachable", "reason": "ssh timed out after 10 seconds", "running": null }
+      ]
+    },
+    {
+      "name": "uptime-kuma", "safe": null, "newest": null, "error": null, "note": null,
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "kuma container", "installed": "1.23.16", "status": "unknown", "reason": "No release feed configured for this app",
+          "running": { "container": "uptime-kuma", "state": "exited", "health": "none", "status": "Exited (1) 3 hours ago" } }
+      ]
+    },
+    {
+      "name": "wiki-sync", "safe": "a1b2c3d", "newest": "a1b2c3d", "error": null, "note": "Tracks a branch, so versions are commit shas",
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "wiki-sync container", "installed": "9f8e7d6", "status": "behind 12", "reason": null,
+          "running": { "container": "wiki-sync", "state": "running", "health": "healthy", "status": "Up 21 days" } }
+      ]
+    },
+    {
+      "name": "site-builder", "safe": null, "newest": null, "error": null, "note": null,
+      "installs": [
+        { "host": "lan", "host_label": "office", "where": "local image", "installed": "2026.10.14-local-7f3a9c2e1d", "status": "own build", "reason": "Built from a local checkout, so there is nothing to compare it with",
+          "running": { "container": "site-builder", "state": "running", "health": "healthy", "status": "Up 6 hours" } }
+      ]
+    },
+    {
+      "name": "grafana", "safe": null, "newest": null, "error": "The release feed answered 503", "note": null,
+      "installs": [
+        { "host": "web", "host_label": "web-1", "where": "metrics stack", "installed": "11.4.0", "status": "unknown", "reason": "The release feed answered 503",
+          "running": { "container": "grafana", "state": "running", "health": "none", "status": "Up 12 days" } }
+      ]
+    }
+  ]
+}

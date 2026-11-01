@@ -1,0 +1,9 @@
+{
+  "census": { "argv": ["cat", "mods/orca-status/census.sample.json"], "cwd": "" },
+  "refresh_minutes": 15,
+  "update": {
+    "argv": ["claude"],
+    "folder": "",
+    "task": "Update {app} on {host} ({where}) from {installed} to {target}. Ask me before you run anything that changes the machine."
+  }
+}

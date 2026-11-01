@@ -2,10 +2,12 @@
 // Orca: its own CLI (`orca status`, `orca worktree ps`, `orca orchestration ...`).
 // Machines: one `sh` sample per machine (Linux and macOS) for CPU, memory, disk,
 // load, uptime and top processes, drawn as bars and a one-minute CPU history.
+// Fleet: the person's own census command (fleet.json), which prints each hosted
+// service with its installed version, latest version and status.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { exec, theme, machines, spaces, agents, window, shared, setShared, nextCommand } from "herdr";
+import { exec, theme, machines, spaces, agents, window, shared, setShared, nextCommand, appHome, readTextFile, openOverlay } from "herdr";
 
 const REFRESH_MS = 15000;
 const MONITOR_MS = 5000;
@@ -17,6 +19,11 @@ const TASK_RANK = { blocked: 0, failed: 1, dispatched: 2, ready: 3, pending: 4, 
 const SPINNER = "mods/orca-status/spinner.svg";
 const CHEVRON = "mods/orca-status";
 const DEFAULT_VIEW = "orca";
+const VIEWS = ["orca", "machines", "fleet"];
+const NEXT_VIEW = { orca: "machines", machines: "fleet", fleet: "orca" };
+const FLEET_CHECK_MS = 60000;
+const FLEET_REFRESH_MINUTES = 15;
+const TONE_RANK = { blocked: 3, working: 2, done: 1, dim: 0 };
 
 // One machine's vitals as key=value lines. POSIX sh; Linux and macOS.
 const STATS = `
@@ -140,6 +147,57 @@ function workspaceStatusLabel(status) {
   return ({ todo: "todo", "in-progress": "in progress", completed: "completed", done: "done" })[status] ?? status ?? "";
 }
 
+const text = (v) => (v === null || v === undefined ? "" : String(v));
+const isObject = (v) => Boolean(v) && typeof v === "object";
+const isArgv = (v) => Array.isArray(v) && v.length > 0 && v.every((a) => typeof a === "string" && a);
+
+// Only the fields the tab draws, as strings, so a census with extra or odd
+// fields can't break the panel and `command` is never in reach of the UI.
+function fleetApps(apps) {
+  return apps.filter(isObject).map((a) => ({
+    name: text(a.name) || "unnamed",
+    safe: text(a.safe),
+    newest: text(a.newest),
+    error: text(a.error),
+    installs: (Array.isArray(a.installs) ? a.installs : []).filter(isObject).map((i) => ({
+      host: text(i.host_label) || text(i.host),
+      where: text(i.where),
+      installed: text(i.installed),
+      status: text(i.status) || "unknown",
+      reason: text(i.reason),
+      running: isObject(i.running)
+        ? { state: text(i.running.state), health: text(i.running.health), status: text(i.running.status) }
+        : null,
+    })),
+  }));
+}
+
+function statusTone(status) {
+  if (status === "current") return "done";
+  if (status.startsWith("behind")) return "working";
+  if (status === "missing" || status === "unreachable" || status === "unknown") return "blocked";
+  return "dim";
+}
+
+// null when the install reports no running state.
+function runningState(r) {
+  if (!r) return null;
+  if (r.state === "running") {
+    if (r.health === "unhealthy" || r.health === "starting") return { word: r.health, tone: "working", up: false };
+    if (r.health === "healthy" || r.health === "none" || !r.health) return { word: "up", tone: "muted", up: true };
+  }
+  return { word: r.state || "unknown", tone: "blocked", up: false };
+}
+
+function appTone(app) {
+  const tones = app.installs.flatMap((i) => {
+    const r = runningState(i.running);
+    return [statusTone(i.status), r && !r.up ? r.tone : "dim"];
+  });
+  if (app.error) tones.push("blocked");
+  return tones.reduce((worst, tone) => (TONE_RANK[tone] > TONE_RANK[worst] ? tone : worst), "dim");
+}
+
 export default class OrcaStatus extends View {
   init(_props, cx) {
     this.snapshot = null;
@@ -152,20 +210,36 @@ export default class OrcaStatus extends View {
     this.showAllDone = false;
     this.showAllWorkspaces = false;
 
-    this.view = shared("orca-status.view") === "machines" ? "machines" : DEFAULT_VIEW;
+    const savedView = shared("orca-status.view");
+    this.view = VIEWS.includes(savedView) ? savedView : DEFAULT_VIEW;
     this.byName = {};
     this.history = {};
     this.monAt = 0;
     this.monLoading = false;
 
+    this.fleet = null;
+    this.fleetConfig = null;
+    this.fleetSetup = false;
+    this.fleetError = null;
+    this.fleetLoading = false;
+    this.fleetTriedAt = 0;
+    this.fleetRanAt = 0;
+    this.fleetRefreshMs = FLEET_REFRESH_MINUTES * 60000;
+
     if (this.view === "machines") this.loadMachines(cx);
+    else if (this.view === "fleet") this.loadFleet(cx);
     else this.load(cx);
     cx.timer.every(REFRESH_MS, (cx) => { if (this.view === "orca") this.load(cx); });
     cx.timer.every(MONITOR_MS, (cx) => { if (this.view === "machines") this.loadMachines(cx); });
+    cx.timer.every(FLEET_CHECK_MS, (cx) => {
+      if (this.view !== "fleet") return;
+      if (this.fleetStale()) this.loadFleet(cx);
+      cx.notify(); // keeps the age on the strip current
+    });
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        if (c === "toggle") this.setView(this.view === "machines" ? "orca" : "machines", cx);
+        if (c === "toggle") this.setView(NEXT_VIEW[this.view], cx);
       }
     });
   }
@@ -175,6 +249,10 @@ export default class OrcaStatus extends View {
     this.view = view;
     setShared("orca-status.view", view);
     cx.notify();
+    if (view === "fleet") {
+      if (!this.fleet || this.fleetStale()) this.loadFleet(cx);
+      return;
+    }
     const stale = view === "machines" ? Date.now() - this.monAt > MONITOR_MS : Date.now() - this.loadedAt > REFRESH_MS;
     if (stale) {
       if (view === "machines") this.loadMachines(cx);
@@ -332,6 +410,70 @@ export default class OrcaStatus extends View {
     });
   }
 
+  // Counted from the last attempt, so a failing census waits its turn instead
+  // of rerunning every minute. Retry and refresh run it straight away.
+  fleetStale() {
+    return Date.now() - this.fleetTriedAt > this.fleetRefreshMs;
+  }
+
+  // Returns the census argv and cwd, or null when fleet.json is absent.
+  async readFleetConfig() {
+    const raw = await readTextFile(`${appHome()}/mods/orca-status/fleet.json`);
+    if (raw === null) return null;
+    let config;
+    try { config = JSON.parse(raw); }
+    catch (e) { throw new Error(`fleet.json isn't valid JSON: ${clean(e?.message ?? String(e))}`); }
+    if (!isArgv(config?.census?.argv)) {
+      throw new Error("fleet.json has no census: it needs census.argv, a list of strings");
+    }
+    return config;
+  }
+
+  loadFleet(cx) {
+    if (this.fleetLoading) return;
+    this.fleetLoading = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        // The old config stays until this read finishes, so a render during it
+        // keeps the Update buttons.
+        const config = await this.readFleetConfig().catch((e) => {
+          this.fleetConfig = null;
+          throw e;
+        });
+        this.fleetConfig = config;
+        this.fleetSetup = config === null;
+        if (config === null) {
+          this.fleetError = null;
+          return;
+        }
+        const minutes = Number(config.refresh_minutes);
+        this.fleetRefreshMs = (minutes > 0 ? minutes : FLEET_REFRESH_MINUTES) * 60000;
+
+        const [command, ...args] = config.census.argv;
+        const r = await exec(command, args, { cwd: config.census.cwd || appHome() });
+        if (r.code !== 0) {
+          const line = (r.stderr || r.stdout).split("\n").find((l) => clean(l)) ?? "";
+          throw new Error(clean(line) ? `Census exited ${r.code}: ${clean(line)}` : `Census exited ${r.code}`);
+        }
+        let data;
+        try { data = JSON.parse(r.stdout); }
+        catch { throw new Error("The census printed output that isn't JSON"); }
+        if (!Array.isArray(data?.apps)) throw new Error("The census output has no apps list");
+        this.fleet = { apps: fleetApps(data.apps), generatedAt: Date.parse(data.generated_at) || 0 };
+        this.fleetRanAt = Date.now();
+        this.fleetError = null;
+      } catch (e) {
+        this.fleetSetup = false;
+        this.fleetError = clean(e?.message ?? String(e)) || "The census didn't answer";
+      } finally {
+        this.fleetLoading = false;
+        this.fleetTriedAt = Date.now();
+        cx.notify();
+      }
+    });
+  }
+
   toggle(set, key, cx) {
     if (set.has(key)) set.delete(key);
     else set.add(key);
@@ -389,12 +531,25 @@ export default class OrcaStatus extends View {
       .when(active, (el) => el.bg(t.raised).text_color(t.foreground).font_medium())
       .when(!active, (el) => el.text_color(t.dim))
       .hover((el) => el.bg(t.hover).text_color(t.foreground))
-      .tooltip(id === "machines" ? "CPU, memory and disk of every machine" : "Orca agents, runs and workspaces")
+      .tooltip(id === "machines" ? "CPU, memory and disk of every machine" : id === "fleet" ? "Each service you host: installed version, latest version and status" : "Orca agents, runs and workspaces")
       .on_click((_e, cx) => this.setView(id, cx))
       .child(label);
   }
 
   health(t) {
+    if (this.view === "fleet") {
+      if (!this.fleet) {
+        return h_flex().gap(5).items_center()
+          .child(div().size(6).flex_none().rounded(3).bg(t.dim))
+          .child(div().text_size(10.5).text_color(t.dim).child("no census"));
+      }
+      const states = this.fleet.apps.flatMap((a) => a.installs).map((i) => runningState(i.running)).filter(Boolean);
+      const up = states.filter((s) => s.up).length;
+      const color = states.length === 0 ? t.dim : up === states.length ? t.done : up === 0 ? t.blocked : t.working;
+      return h_flex().gap(5).items_center()
+        .child(div().size(6).flex_none().rounded(3).bg(color))
+        .child(div().text_size(10.5).text_color(color).child(`${up}/${states.length} up`));
+    }
     if (this.view === "machines") {
       const list = machines();
       let live = 0;
@@ -418,11 +573,12 @@ export default class OrcaStatus extends View {
   }
 
   header(t) {
-    const busy = this.view === "machines" ? this.monLoading : this.loading;
+    const busy = this.view === "machines" ? this.monLoading : this.view === "fleet" ? this.fleetLoading : this.loading;
     return h_flex()
       .h(42).flex_none().px(10).gap(4).items_center().border_b(1).border_color(t.border)
       .child(this.viewPill("orca", "Orca", t))
       .child(this.viewPill("machines", "Machines", t))
+      .child(this.viewPill("fleet", "Fleet", t))
       .child(div().flex_1())
       .child(this.health(t))
       .child(
@@ -431,7 +587,7 @@ export default class OrcaStatus extends View {
           .size(24).flex().items_center().justify_center().rounded(6)
           .text_size(14).text_color(busy ? t.working : t.dim)
           .hover((el) => el.bg(t.hover).text_color(t.foreground))
-          .on_click((_e, cx) => (this.view === "machines" ? this.loadMachines(cx) : this.load(cx)))
+          .on_click((_e, cx) => (this.view === "machines" ? this.loadMachines(cx) : this.view === "fleet" ? this.loadFleet(cx) : this.load(cx)))
           .tooltip("Refresh now")
           .child(busy ? svg(SPINNER).size(12).flex_none().text_color(t.working).spin(900) : "↻"),
       );
@@ -564,6 +720,129 @@ export default class OrcaStatus extends View {
       .child(
         div().id("orca-machines").flex_1().min_h(0).overflow_y_scrollbar().pt(6)
           .children(list.map((m) => this.machineCard(m, t, now, info[m.name ?? ""] ?? {})))
+          .child(div().h(2)),
+      );
+  }
+
+  /* ---------- fleet ---------- */
+
+  updateConfirm(app, install) {
+    const update = this.fleetConfig?.update;
+    if (!isObject(update) || !isArgv(update.argv) || typeof update.task !== "string") return null;
+    if (!install.status.startsWith("behind") || !app.safe) return null;
+    const values = { app: app.name, host: install.host, where: install.where, installed: install.installed, target: app.safe };
+    const agent = update.argv[0].split("/").pop();
+    return {
+      title: `Update ${app.name} on ${install.host}?`,
+      detail: `${install.installed} → ${app.safe}. Opens a ${agent} tab with this brief; nothing changes until you approve it there.`,
+      command: {
+        name: "tab.new",
+        args: {
+          name: `update ${app.name}`,
+          folder: update.folder || appHome(),
+          argv: update.argv,
+          // One pass, so a version containing "{host}" stays as it is.
+          task: update.task.replace(/\{(app|host|where|installed|target)\}/g, (_m, key) => values[key]),
+        },
+      },
+    };
+  }
+
+  installRow(app, install, id, t) {
+    const place = [install.host, install.where].filter(Boolean).join(" · ");
+    const tone = statusTone(install.status);
+    const running = runningState(install.running);
+    const confirm = this.updateConfirm(app, install);
+    return v_flex().gap(3)
+      .child(
+        h_flex().gap(6).items_center()
+          .child(div().id(`${id}-place`).flex_1().min_w(0).truncate().text_size(10.5).text_color(t.muted).tooltip(place).child(place))
+          .child(div().id(`${id}-version`).flex_none().max_w(78).truncate().text_size(10).text_color(t.foreground).tooltip(install.installed || "No version").child(install.installed || "—"))
+          .child(this.chip(div().min_w(0).truncate().child(install.status), t[tone], tone !== "dim").id(`${id}-status`).flex_none().max_w(96)
+            .tooltip(install.reason || install.status)),
+      )
+      .when(Boolean(running) || Boolean(confirm), (el) => el.child(
+        h_flex().gap(6).items_center()
+          .when(Boolean(running), (x) => x.child(
+            div().id(`${id}-running`).min_w(0).max_w(170).truncate().text_size(10).text_color(t[running.tone]).tooltip(install.running.status || running.word).child(running.word),
+          ))
+          .child(div().flex_1())
+          .when(Boolean(confirm), (x) => x.child(
+            div().id(`${id}-update`).flex_none().px(8).py(2).rounded(6).bg(t.raised).text_size(10.5).text_color(t.foreground).cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_click(() => { openOverlay({ mod: "confirm", kind: "dialog", width: 380, height: 190, props: confirm }); })
+              .child("Update"),
+          )),
+      ));
+  }
+
+  appCard(app, index, t) {
+    const id = `orca-fleet-${index}`;
+    return v_flex()
+      .id(id)
+      .mx(6).mb(6).px(9).py(8).gap(6).rounded(8)
+      .bg(t.surface).border_1().border_color(t.border)
+      .child(
+        v_flex().gap(1)
+          .child(
+            h_flex().gap(7).items_center()
+              .child(div().size(7).flex_none().rounded(4).bg(t[appTone(app)]))
+              .child(div().id(`${id}-name`).flex_1().min_w(0).truncate().font_medium().text_size(12.5).text_color(t.foreground).tooltip(app.name).child(app.name))
+              .when(Boolean(app.newest), (el) => el.child(
+                div().id(`${id}-latest`).flex_none().max_w(120).truncate().text_size(9.5).text_color(t.dim).tooltip(app.newest).child(`latest ${app.newest}`),
+              )),
+          )
+          .when(Boolean(app.safe) && app.safe !== app.newest, (el) => el.child(
+            div().id(`${id}-safe`).truncate().text_size(9.5).text_color(t.dim).tooltip(app.safe).child(`safe to adopt ${app.safe}`),
+          )),
+      )
+      .when(Boolean(app.error), (el) => el.child(
+        div().id(`${id}-error`).truncate().text_size(10).text_color(t.blocked).tooltip(app.error).child(app.error),
+      ))
+      .children(app.installs.map((install, i) => this.installRow(app, install, `${id}-${i}`, t)));
+  }
+
+  fleetView(t, now) {
+    if (this.fleetSetup) {
+      return v_flex().flex_1().min_h(0).items_center().justify_center().gap(6).px(20)
+        .child(div().text_size(12).text_color(t.foreground).child("No fleet.json yet"))
+        .child(div().text_size(11).text_color(t.dim).child("Copy mods/orca-status/fleet.example.json to fleet.json in the same folder, then point census at your own command."));
+    }
+    if (!this.fleet) {
+      return v_flex().flex_1().min_h(0).items_center().justify_center().gap(10).px(20)
+        .when(this.fleetLoading, (el) => el
+          .child(svg(SPINNER).size(20).flex_none().text_color(t.working).spin(900))
+          .child(div().text_size(11.5).text_color(t.dim).child("Reading the fleet…")))
+        .when(!this.fleetLoading && Boolean(this.fleetError), (el) => el
+          .child(div().id("orca-fleet-error").max_w(236).truncate().text_size(12).text_color(t.blocked).tooltip(this.fleetError).child(this.fleetError))
+          .child(div().id("orca-fleet-retry").px(10).py(4).rounded(6).bg(t.raised).text_size(11).text_color(t.foreground).cursor_pointer().on_click((_e, cx) => this.loadFleet(cx)).child("Retry")));
+    }
+
+    const installs = this.fleet.apps.flatMap((a) => a.installs);
+    const toUpdate = installs.filter((i) => i.status.startsWith("behind")).length;
+    const down = installs.filter((i) => { const r = runningState(i.running); return r && !r.up; }).length;
+    const ranAt = this.fleet.generatedAt || this.fleetRanAt;
+
+    return v_flex().flex_1().min_h(0)
+      .when(Boolean(this.fleetError), (el) => el.child(
+        h_flex().flex_none().px(12).py(7).gap(8).items_center().bg(t.blocked + "18").border_b(1).border_color(t.border)
+          .child(div().text_size(11).text_color(t.blocked).child("!"))
+          .child(div().id("orca-fleet-error").flex_1().min_w(0).truncate().text_size(10.5).text_color(t.blocked).tooltip(this.fleetError).child(this.fleetError))
+          .child(div().id("orca-fleet-retry-banner").px(6).py(2).rounded(4).text_size(10).text_color(t.foreground).cursor_pointer().on_click((_e, cx) => this.loadFleet(cx)).child("Retry")),
+      ))
+      .child(
+        h_flex().flex_none().px(14).py(7).gap(6).items_center().border_b(1).border_color(t.border)
+          .child(div().text_size(10.5).text_color(toUpdate > 0 ? t.working : t.dim).child(`${toUpdate} to update`))
+          .when(down > 0, (el) => el
+            .child(div().text_size(10.5).text_color(t.dim).child("·"))
+            .child(div().text_size(10.5).font_medium().text_color(t.blocked).child(`${down} down`)))
+          .child(div().flex_1())
+          .child(div().text_size(10.5).text_color(t.dim).child(ago(ranAt, now))),
+      )
+      .child(
+        div().id("orca-fleet").flex_1().min_h(0).overflow_y_scrollbar().pt(6)
+          .when(this.fleet.apps.length === 0, (el) => el.child(div().px(16).py(6).text_size(11).text_color(t.dim).child("The census lists no apps.")))
+          .children(this.fleet.apps.map((app, i) => this.appCard(app, i, t)))
           .child(div().h(2)),
       );
   }
@@ -787,6 +1066,7 @@ export default class OrcaStatus extends View {
       .bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(this.header(t))
       .when(this.view === "machines", (el) => el.child(this.machinesView(t, now)))
+      .when(this.view === "fleet", (el) => el.child(this.fleetView(t, now)))
       .when(this.view === "orca", (el) => el.child(this.orcaView(t, now)));
   }
 }
